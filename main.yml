@@ -1,0 +1,243 @@
+name: TLB EARN BOT
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependency
+        run: pip install python-telegram-bot==22.3
+
+      - name: Create bot
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          ADMIN_ID: ${{ secrets.ADMIN_ID }}
+        run: |
+          cat > bot.py <<'PY'
+          import os, sqlite3, asyncio
+          from datetime import datetime, date
+          from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+          from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
+
+          TOKEN = os.environ["BOT_TOKEN"]
+          ADMIN_ID = int(os.environ["ADMIN_ID"])
+          DB = "tlb_earn.db"
+
+          def db():
+              c = sqlite3.connect(DB)
+              c.execute("""CREATE TABLE IF NOT EXISTS users(
+                  id INTEGER PRIMARY KEY, username TEXT, balance REAL DEFAULT 0,
+                  refs INTEGER DEFAULT 0, ref_by INTEGER, joined TEXT DEFAULT CURRENT_TIMESTAMP,
+                  last_bonus TEXT)""")
+              c.execute("""CREATE TABLE IF NOT EXISTS tasks(
+                  id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, reward REAL,
+                  url TEXT, active INTEGER DEFAULT 1)""")
+              c.execute("""CREATE TABLE IF NOT EXISTS claims(
+                  user_id INTEGER, task_id INTEGER, claimed TEXT DEFAULT CURRENT_TIMESTAMP,
+                  UNIQUE(user_id,task_id))""")
+              c.execute("""CREATE TABLE IF NOT EXISTS withdrawals(
+                  id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, amount REAL,
+                  method TEXT, account TEXT, status TEXT DEFAULT 'pending',
+                  created TEXT DEFAULT CURRENT_TIMESTAMP)""")
+              c.commit()
+              return c
+
+          def menu():
+              return InlineKeyboardMarkup([
+                  [InlineKeyboardButton("📋 Tasks", callback_data="tasks"),
+                   InlineKeyboardButton("💰 Balance", callback_data="balance")],
+                  [InlineKeyboardButton("🎁 Daily Bonus", callback_data="bonus"),
+                   InlineKeyboardButton("👥 Referral", callback_data="referral")],
+                  [InlineKeyboardButton("💸 Withdraw", callback_data="withdraw"),
+                   InlineKeyboardButton("📊 Statistics", callback_data="stats")],
+                  [InlineKeyboardButton("📜 My Withdrawals", callback_data="mywithdrawals")]
+              ])
+
+          def admin_menu():
+              return InlineKeyboardMarkup([
+                  [InlineKeyboardButton("📊 Stats", callback_data="astats"),
+                   InlineKeyboardButton("👥 Users", callback_data="ausers")],
+                  [InlineKeyboardButton("📋 Tasks", callback_data="atasks"),
+                   InlineKeyboardButton("💸 Withdrawals", callback_data="awithdrawals")],
+                  [InlineKeyboardButton("📢 Broadcast", callback_data="broadcast")]
+              ])
+
+          async def start(update, context):
+              u=update.effective_user; c=db()
+              if not c.execute("SELECT 1 FROM users WHERE id=?", (u.id,)).fetchone():
+                  ref=None
+                  if context.args and context.args[0].isdigit():
+                      x=int(context.args[0])
+                      if x!=u.id and c.execute("SELECT 1 FROM users WHERE id=?", (x,)).fetchone():
+                          ref=x
+                          c.execute("UPDATE users SET balance=balance+1,refs=refs+1 WHERE id=?", (x,))
+                  c.execute("INSERT INTO users(id,username,ref_by) VALUES(?,?,?)",(u.id,u.username or "",ref))
+                  c.commit()
+              c.close()
+              await update.message.reply_text(
+                  "👋 Welcome to TLB EARN!\n\nComplete tasks, collect rewards and request withdrawals.",
+                  reply_markup=menu())
+
+          async def tasks(update, context):
+              q=update.callback_query; await q.answer(); c=db()
+              rows=c.execute("""SELECT id,title,reward,url FROM tasks WHERE active=1
+                  AND id NOT IN (SELECT task_id FROM claims WHERE user_id=?)""",(q.from_user.id,)).fetchall()
+              c.close()
+              if not rows:
+                  await q.edit_message_text("📋 No new tasks right now.",reply_markup=menu()); return
+              b=[[InlineKeyboardButton(f"▶️ {x[1]} • +{x[2]}",callback_data=f"task:{x[0]}")] for x in rows]
+              b.append([InlineKeyboardButton("🔙 Menu",callback_data="menu")])
+              await q.edit_message_text("📋 Available Tasks:",reply_markup=InlineKeyboardMarkup(b))
+
+          async def open_task(update, context):
+              q=update.callback_query; await q.answer(); tid=int(q.data.split(":")[1]); c=db()
+              r=c.execute("SELECT title,reward,url FROM tasks WHERE id=? AND active=1",(tid,)).fetchone(); c.close()
+              if not r: return
+              await q.edit_message_text(f"🎯 {r[0]}\n💰 Reward: {r[1]}\n\nOpen the task and complete it.",
+                  reply_markup=InlineKeyboardMarkup([
+                      [InlineKeyboardButton("🔗 Open",url=r[2])],
+                      [InlineKeyboardButton("✅ Claim Reward",callback_data=f"claim:{tid}")],
+                      [InlineKeyboardButton("🔙 Tasks",callback_data="tasks")]]))
+
+          async def claim(update, context):
+              q=update.callback_query; await q.answer(); tid=int(q.data.split(":")[1]); c=db()
+              r=c.execute("SELECT reward FROM tasks WHERE id=? AND active=1",(tid,)).fetchone()
+              if not r: c.close(); return
+              try:
+                  c.execute("INSERT INTO claims(user_id,task_id) VALUES(?,?)",(q.from_user.id,tid))
+                  c.execute("UPDATE users SET balance=balance+? WHERE id=?",(r[0],q.from_user.id)); c.commit()
+                  msg=f"✅ Task claimed!\n💰 +{r[0]:.2f}"
+              except sqlite3.IntegrityError: msg="⚠️ Already claimed."
+              c.close(); await q.edit_message_text(msg,reply_markup=menu())
+
+          async def balance(update, context):
+              q=update.callback_query; await q.answer(); c=db()
+              r=c.execute("SELECT balance FROM users WHERE id=?",(q.from_user.id,)).fetchone(); c.close()
+              await q.edit_message_text(f"💰 Balance: {r[0]:.2f}",reply_markup=menu())
+
+          async def bonus(update, context):
+              q=update.callback_query; c=db(); today=str(date.today())
+              r=c.execute("SELECT last_bonus FROM users WHERE id=?",(q.from_user.id,)).fetchone()
+              if r and r[0]==today:
+                  msg="⏳ Daily bonus already claimed today."
+              else:
+                  c.execute("UPDATE users SET balance=balance+0.50,last_bonus=? WHERE id=?",(today,q.from_user.id)); c.commit()
+                  msg="🎁 Daily bonus claimed!\n💰 +0.50"
+              c.close(); await q.answer(); await q.edit_message_text(msg,reply_markup=menu())
+
+          async def referral(update, context):
+              q=update.callback_query; await q.answer(); c=db()
+              refs=c.execute("SELECT refs FROM users WHERE id=?",(q.from_user.id,)).fetchone()[0]; c.close()
+              me=await context.bot.get_me()
+              await q.edit_message_text(
+                  f"👥 Referrals: {refs}\n\nhttps://t.me/{me.username}?start={q.from_user.id}\n\nReferral reward: 1.00",
+                  reply_markup=menu())
+
+          async def stats(update, context):
+              q=update.callback_query; await q.answer(); c=db()
+              u=c.execute("SELECT balance,refs FROM users WHERE id=?",(q.from_user.id,)).fetchone()
+              done=c.execute("SELECT COUNT(*) FROM claims WHERE user_id=?",(q.from_user.id,)).fetchone()[0]; c.close()
+              await q.edit_message_text(f"📊 Statistics\n\n💰 Balance: {u[0]:.2f}\n👥 Referrals: {u[1]}\n✅ Tasks: {done}",reply_markup=menu())
+
+          async def withdraw(update, context):
+              q=update.callback_query; await q.answer()
+              context.user_data["state"]="withdraw_amount"
+              await q.edit_message_text("💸 Enter withdrawal amount.\nMinimum: 5.00")
+
+          async def mywithdrawals(update, context):
+              q=update.callback_query; await q.answer(); c=db()
+              rows=c.execute("SELECT amount,method,account,status FROM withdrawals WHERE user_id=? ORDER BY id DESC LIMIT 10",(q.from_user.id,)).fetchall(); c.close()
+              text="📜 My Withdrawals\n\n"+("\n".join(f"{a:.2f} • {m} • {s}" for a,m,s in rows) if rows else "No withdrawals yet.")
+              await q.edit_message_text(text,reply_markup=menu())
+
+          async def text_handler(update, context):
+              u=update.effective_user; state=context.user_data.get("state")
+              if state=="withdraw_amount":
+                  try: amount=float(update.message.text)
+                  except: await update.message.reply_text("Enter a valid number."); return
+                  c=db(); bal=c.execute("SELECT balance FROM users WHERE id=?",(u.id,)).fetchone()[0]
+                  if amount<5 or amount>bal:
+                      c.close(); await update.message.reply_text(f"Minimum is 5.00 and your balance is {bal:.2f}."); return
+                  context.user_data["amount"]=amount; context.user_data["state"]="withdraw_method"; c.close()
+                  await update.message.reply_text("Enter payment method, e.g. bKash / Nagad:")
+              elif state=="withdraw_method":
+                  context.user_data["method"]=update.message.text.strip(); context.user_data["state"]="withdraw_account"
+                  await update.message.reply_text("Enter your payment account/number:")
+              elif state=="withdraw_account":
+                  amount=context.user_data["amount"]; method=context.user_data["method"]; account=update.message.text.strip()
+                  c=db(); bal=c.execute("SELECT balance FROM users WHERE id=?",(u.id,)).fetchone()[0]
+                  if amount>bal: c.close(); await update.message.reply_text("Insufficient balance."); return
+                  c.execute("UPDATE users SET balance=balance-? WHERE id=?",(amount,u.id))
+                  c.execute("INSERT INTO withdrawals(user_id,amount,method,account) VALUES(?,?,?,?)",(u.id,amount,method,account)); c.commit(); c.close()
+                  context.user_data.clear()
+                  await update.message.reply_text("✅ Withdrawal request submitted.\n⏳ Status: Pending",reply_markup=menu())
+                  await context.bot.send_message(ADMIN_ID,f"💸 New withdrawal\nUser: {u.id}\nAmount: {amount:.2f}\nMethod: {method}\nAccount: {account}")
+              elif u.id==ADMIN_ID and state=="addtask":
+                  parts=update.message.text.split("|",2)
+                  if len(parts)!=3: await update.message.reply_text("Format: title|reward|url"); return
+                  title,reward,url=parts
+                  c=db(); c.execute("INSERT INTO tasks(title,reward,url) VALUES(?,?,?)",(title,float(reward),url)); c.commit(); c.close()
+                  context.user_data.clear(); await update.message.reply_text("✅ Task added.")
+              elif u.id==ADMIN_ID and state=="broadcast":
+                  c=db(); ids=[x[0] for x in c.execute("SELECT id FROM users").fetchall()]; c.close()
+                  sent=0
+                  for uid in ids:
+                      try: await context.bot.send_message(uid,update.message.text); sent+=1
+                      except: pass
+                  context.user_data.clear(); await update.message.reply_text(f"📢 Broadcast sent: {sent}")
+
+          async def admin(update, context):
+              if update.effective_user.id!=ADMIN_ID: return
+              await update.message.reply_text("👨‍💼 TLB EARN Admin Panel",reply_markup=admin_menu())
+
+          async def admin_cb(update, context):
+              q=update.callback_query; await q.answer()
+              if q.from_user.id!=ADMIN_ID: return
+              c=db()
+              if q.data=="astats":
+                  users=c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+                  pending=c.execute("SELECT COUNT(*) FROM withdrawals WHERE status='pending'").fetchone()[0]
+                  await q.edit_message_text(f"📊 Admin Stats\nUsers: {users}\nPending withdrawals: {pending}",reply_markup=admin_menu())
+              elif q.data=="ausers":
+                  n=c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+                  await q.edit_message_text(f"👥 Total users: {n}",reply_markup=admin_menu())
+              elif q.data=="atasks":
+                  context.user_data["state"]="addtask"
+                  await q.edit_message_text("Send: title|reward|url\nExample: Join Channel|1|https://t.me/yourchannel")
+              elif q.data=="awithdrawals":
+                  rows=c.execute("SELECT id,user_id,amount,method,account FROM withdrawals WHERE status='pending' ORDER BY id DESC LIMIT 10").fetchall()
+                  if not rows: text="No pending withdrawals."
+                  else: text="📋 Pending:\n"+"\n".join(f"#{i} user {u} • {a:.2f} • {m} • {acc}" for i,u,a,m,acc in rows)
+                  await q.edit_message_text(text,reply_markup=admin_menu())
+              elif q.data=="broadcast":
+                  context.user_data["state"]="broadcast"; await q.edit_message_text("Send the broadcast message now.")
+              c.close()
+
+          async def menu_cb(update, context):
+              q=update.callback_query; await q.answer(); await q.edit_message_text("🏠 TLB EARN",reply_markup=menu())
+
+          app=Application.builder().token(TOKEN).build()
+          app.add_handler(CommandHandler("start",start))
+          app.add_handler(CommandHandler("admin",admin))
+          app.add_handler(CallbackQueryHandler(admin_cb,pattern="^(astats|ausers|atasks|awithdrawals|broadcast)$"))
+          app.add_handler(CallbackQueryHandler(tasks,pattern="^tasks$"))
+          app.add_handler(CallbackQueryHandler(open_task,pattern="^task:\\d+$"))
+          app.add_handler(CallbackQueryHandler(claim,pattern="^claim:\\d+$"))
+          app.add_handler(CallbackQueryHandler(balance,pattern="^balance$"))
+          app.add_handler(CallbackQueryHandler(bonus,pattern="^bonus$"))
+          app.add_handler(CallbackQueryHandler(referral,pattern="^referral$"))
+          app.add_handler(CallbackQueryHandler(stats,pattern="^stats$"))
+          app.add_handler(CallbackQueryHandler(withdraw,pattern="^withdraw$"))
+          app.add_handler(CallbackQueryHandler(mywithdrawals,pattern="^mywithdrawals$"))
+          app.add_handler(CallbackQueryHandler(menu_cb,pattern="^menu$"))
+          app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,text_handler))
+          app.run_polling()
+          PY
+          python bot.py
