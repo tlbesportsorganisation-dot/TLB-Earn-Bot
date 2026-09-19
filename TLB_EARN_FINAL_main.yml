@@ -1,0 +1,181 @@
+name: TLB EARN BOT
+on:
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    env:
+      BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+      ADMIN_ID: ${{ secrets.ADMIN_ID }}
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install python-telegram-bot==22.3
+      - name: Create bot
+        run: |
+          cat > bot.py <<'PY'
+          import os, sqlite3
+          from datetime import datetime, timezone, timedelta
+          from telegram import Update, InlineKeyboardButton as B, InlineKeyboardMarkup as M
+          from telegram.ext import Application,CommandHandler,CallbackQueryHandler,MessageHandler,ContextTypes,filters
+
+          TOKEN=os.getenv("BOT_TOKEN",""); ADMIN=int(os.getenv("ADMIN_ID","0") or 0)
+          if not TOKEN or not ADMIN: raise SystemExit("Set BOT_TOKEN and ADMIN_ID in GitHub Secrets.")
+          db=sqlite3.connect("tlb_earn.db",check_same_thread=False); db.row_factory=sqlite3.Row
+          db.executescript("""
+          CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY,name TEXT,user TEXT,balance REAL DEFAULT 0,refs INTEGER DEFAULT 0,last_daily TEXT,banned INTEGER DEFAULT 0,created TEXT);
+          CREATE TABLE IF NOT EXISTS tasks(id INTEGER PRIMARY KEY AUTOINCREMENT,title TEXT,kind TEXT,reward REAL,url TEXT,channel TEXT,active INTEGER DEFAULT 1);
+          CREATE TABLE IF NOT EXISTS claims(uid INTEGER,tid INTEGER,created TEXT,PRIMARY KEY(uid,tid));
+          CREATE TABLE IF NOT EXISTS accounts(id INTEGER PRIMARY KEY AUTOINCREMENT,uid INTEGER,method TEXT,name TEXT,number TEXT,UNIQUE(uid,method,number));
+          CREATE TABLE IF NOT EXISTS withdrawals(id INTEGER PRIMARY KEY AUTOINCREMENT,uid INTEGER,method TEXT,name TEXT,number TEXT,amount REAL,status TEXT DEFAULT 'pending',created TEXT);
+          CREATE TABLE IF NOT EXISTS tx(id INTEGER PRIMARY KEY AUTOINCREMENT,uid INTEGER,amount REAL,kind TEXT,note TEXT,created TEXT);
+          """); db.commit()
+          def now(): return datetime.now(timezone.utc).isoformat(timespec="seconds")
+          def u(uid): return db.execute("SELECT * FROM users WHERE id=?",(uid,)).fetchone()
+          def ensure(x,ref=None):
+              if u(x.id): db.execute("UPDATE users SET name=?,user=? WHERE id=?",(x.first_name or "",x.username or "",x.id)); db.commit(); return
+              db.execute("INSERT INTO users(id,name,user,created) VALUES(?,?,?,?)",(x.id,x.first_name or "",x.username or "",now()))
+              if ref and ref!=x.id and u(ref):
+                  db.execute("UPDATE users SET balance=balance+1,refs=refs+1 WHERE id=?",(ref,))
+                  db.execute("INSERT INTO tx(uid,amount,kind,note,created) VALUES(?,?,?,?,?)",(ref,1,"referral","Referral",now()))
+              db.commit()
+          def credit(uid,amt,kind,note):
+              db.execute("UPDATE users SET balance=balance+? WHERE id=?",(amt,uid))
+              db.execute("INSERT INTO tx(uid,amount,kind,note,created) VALUES(?,?,?,?,?)",(uid,amt,kind,note,now())); db.commit()
+          def home_kb():
+              return M([[B("📋 Tasks","tasks"),B("💰 Balance","bal")],[B("🎁 Daily Bonus","daily"),B("👥 Referral","ref")],[B("💸 Withdraw","wd"),B("🧾 History","hist")],[B("👤 Profile","profile"),B("🏆 Top Earners","top")]])
+          async def start(up,c):
+              ref=None
+              if c.args:
+                  try: ref=int(c.args[0])
+                  except: pass
+              ensure(up.effective_user,ref)
+              await up.message.reply_text("🎉 <b>TLB EARN</b>\n\nComplete tasks, earn rewards, and withdraw.",parse_mode="HTML",reply_markup=home_kb())
+          async def admin(up,c):
+              if up.effective_user.id!=ADMIN:return
+              await up.message.reply_text("🛠 <b>ADMIN PANEL</b>",parse_mode="HTML",reply_markup=M([[B("📊 Stats","as"),B("📋 Tasks","at")],[B("➕ Add Task","add"),B("💸 Withdrawals","aw")],[B("👥 Users","au"),B("📢 Broadcast","bc")]]))
+          async def menu(up,text):
+              await up.callback_query.edit_message_text(text,parse_mode="HTML",reply_markup=home_kb())
+          async def cb(up,c):
+              q=up.callback_query; await q.answer(); uid=q.from_user.id; ensure(q.from_user)
+              if q.data=="home": await menu(up,"🏠 <b>TLB EARN</b>"); return
+              if q.data=="bal": await q.edit_message_text(f"💰 <b>Balance:</b> ৳{u(uid)['balance']:.2f}",parse_mode="HTML",reply_markup=M([[B("⬅️ Back","home")]]))
+              elif q.data=="profile":
+                  r=u(uid); await q.edit_message_text(f"👤 <b>Profile</b>\n\nID: <code>{uid}</code>\nName: {r['name']}\nBalance: ৳{r['balance']:.2f}\nReferrals: {r['refs']}",parse_mode="HTML",reply_markup=M([[B("⬅️ Back","home")]]))
+              elif q.data=="tasks":
+                  rows=db.execute("SELECT * FROM tasks WHERE active=1 ORDER BY id DESC").fetchall(); kb=[]
+                  for t in rows:
+                      done=db.execute("SELECT 1 FROM claims WHERE uid=? AND tid=?",(uid,t["id"])).fetchone()
+                      kb.append([B(("✅ " if done else "▶️ ")+f"{t['title']} +৳{t['reward']:.2f}","noop" if done else f"task:{t['id']}")])
+                  if not kb: kb=[[B("No tasks yet","noop")]]
+                  kb.append([B("⬅️ Back","home")]); await q.edit_message_text("📋 <b>Tasks</b>",parse_mode="HTML",reply_markup=M(kb))
+              elif q.data.startswith("task:"):
+                  tid=int(q.data.split(":")[1]); t=db.execute("SELECT * FROM tasks WHERE id=? AND active=1",(tid,)).fetchone()
+                  if not t:return
+                  buttons=[[B("🔗 Open Task",url=t["url"])]]
+                  buttons.append([B("✅ Verify Join",callback_data=f"verify:{tid}") if t["kind"].lower()=="join" else B("✅ I Completed It",callback_data=f"claim:{tid}")])
+                  buttons.append([B("⬅️ Tasks","tasks")])
+                  await q.edit_message_text(f"📌 <b>{t['title']}</b>\n\nReward: ৳{t['reward']:.2f}\nComplete it, then verify.",parse_mode="HTML",reply_markup=M(buttons))
+              elif q.data.startswith("verify:"):
+                  tid=int(q.data.split(":")[1]); t=db.execute("SELECT * FROM tasks WHERE id=?",(tid,)).fetchone()
+                  if not t:return
+                  if db.execute("SELECT 1 FROM claims WHERE uid=? AND tid=?",(uid,tid)).fetchone(): await q.answer("Already credited.",show_alert=True); return
+                  try:
+                      m=await c.bot.get_chat_member(t["channel"],uid)
+                      if m.status not in ("member","administrator","creator"): raise ValueError()
+                      db.execute("INSERT INTO claims VALUES(?,?,?)",(uid,tid,now())); credit(uid,t["reward"],"task",t["title"])
+                      await q.answer(f"Verified! ৳{t['reward']:.2f} credited.",show_alert=True); await menu(up,"✅ <b>Task verified and credited.</b>")
+                  except: await q.answer("❌ Not joined. Join first. Bot must be admin in the channel.",show_alert=True)
+              elif q.data.startswith("claim:"):
+                  tid=int(q.data.split(":")[1]); t=db.execute("SELECT * FROM tasks WHERE id=?",(tid,)).fetchone()
+                  try: db.execute("INSERT INTO claims VALUES(?,?,?)",(uid,tid,now())); credit(uid,t["reward"],"task",t["title"]); await q.answer("Reward credited!",show_alert=True)
+                  except: await q.answer("Already completed.",show_alert=True)
+              elif q.data=="daily":
+                  r=u(uid); ok=not r["last_daily"]
+                  if r["last_daily"]:
+                      try: ok=datetime.now(timezone.utc)-datetime.fromisoformat(r["last_daily"])>=timedelta(hours=24)
+                      except: pass
+                  if not ok: await q.answer("Come back after 24 hours.",show_alert=True)
+                  else: db.execute("UPDATE users SET last_daily=? WHERE id=?",(now(),uid)); db.commit(); credit(uid,.5,"daily","Daily bonus"); await q.answer("৳0.50 credited!",show_alert=True)
+              elif q.data=="ref":
+                  await q.edit_message_text(f"👥 <b>Referral</b>\n\nYour link:\n<code>https://t.me/{c.bot.username}?start={uid}</code>\n\nReward: ৳1.00\nReferrals: {u(uid)['refs']}",parse_mode="HTML",reply_markup=M([[B("⬅️ Back","home")]]))
+              elif q.data=="hist":
+                  rs=db.execute("SELECT * FROM withdrawals WHERE uid=? ORDER BY id DESC LIMIT 10",(uid,)).fetchall()
+                  txt="🧾 <b>Withdrawals</b>\n\n"+("\n".join(f"#{r['id']} {r['method']} ৳{r['amount']:.2f} — {r['status']}" for r in rs) if rs else "No withdrawals.")
+                  await q.edit_message_text(txt,parse_mode="HTML",reply_markup=M([[B("⬅️ Back","home")]]))
+              elif q.data=="wd":
+                  c.user_data["state"]="method"; await q.edit_message_text("💸 <b>Withdraw</b>\n\nMinimum: ৳5.00\nChoose method:",parse_mode="HTML",reply_markup=M([[B("bKash","m:bKash"),B("Nagad","m:Nagad")],[B("⬅️ Back","home")]]))
+              elif q.data.startswith("m:"):
+                  m=q.data[2:]; c.user_data["method"]=m; acc=db.execute("SELECT * FROM accounts WHERE uid=? AND method=?",(uid,m)).fetchall()
+                  kb=[[B("➕ New account","newacct")]]+[ [B(f"{a['name']} ••••{a['number'][-4:]}",f"acc:{a['id']}")] for a in acc]
+                  await q.edit_message_text(f"💳 <b>{m}</b>\n\nChoose saved account or add new.",parse_mode="HTML",reply_markup=M(kb))
+              elif q.data=="newacct": c.user_data["state"]="aname"; await q.edit_message_text("Enter account name:")
+              elif q.data.startswith("acc:"):
+                  c.user_data["aid"]=int(q.data[4:]); c.user_data["state"]="amount"; await q.edit_message_text("Enter withdrawal amount:")
+              elif q.data=="top":
+                  rs=db.execute("SELECT name,balance FROM users ORDER BY balance DESC LIMIT 10").fetchall()
+                  await q.edit_message_text("🏆 <b>Top Earners</b>\n\n"+"\n".join(f"{i+1}. {r['name']} — ৳{r['balance']:.2f}" for i,r in enumerate(rs)),parse_mode="HTML",reply_markup=M([[B("⬅️ Back","home")]]))
+              elif q.data in ("as","at","add","aw","au","bc") and uid==ADMIN: await admin_cb(q,c)
+              elif q.data.startswith("ap:") and uid==ADMIN:
+                  wid=int(q.data[3:]); db.execute("UPDATE withdrawals SET status='approved' WHERE id=?",(wid,)); db.commit(); await q.edit_message_text(f"✅ Withdrawal #{wid} approved.")
+              elif q.data.startswith("rj:") and uid==ADMIN:
+                  wid=int(q.data[3:]); w=db.execute("SELECT * FROM withdrawals WHERE id=?",(wid,)).fetchone()
+                  if w and w["status"]=="pending": db.execute("UPDATE withdrawals SET status='rejected' WHERE id=?",(wid,)); credit(w["uid"],w["amount"],"refund","Rejected withdrawal"); await q.edit_message_text(f"❌ Withdrawal #{wid} rejected and refunded.")
+          async def admin_cb(q,c):
+              if q.data=="as":
+                  x=db.execute("SELECT COUNT(*) n FROM users").fetchone()["n"]; w=db.execute("SELECT COUNT(*) n FROM withdrawals WHERE status='pending'").fetchone()["n"]
+                  await q.edit_message_text(f"📊 Users: {x}\nPending withdrawals: {w}",reply_markup=M([[B("⬅️ Admin","ah")]]))
+              elif q.data=="at":
+                  rs=db.execute("SELECT * FROM tasks ORDER BY id DESC").fetchall()
+                  await q.edit_message_text("📋 <b>Tasks</b>\n\n"+("\n".join(f"#{r['id']} {r['title']} | {r['kind']} | ৳{r['reward']}" for r in rs) or "None"),parse_mode="HTML",reply_markup=M([[B("➕ Add","add")],[B("⬅️ Admin","ah")]]))
+              elif q.data=="add": c.user_data["astate"]="task"; await q.edit_message_text("Send:\n<code>Title | kind | reward | URL | channel</code>\nFor Join: kind=join and channel=@YourChannel. Otherwise channel=-",parse_mode="HTML")
+              elif q.data=="aw":
+                  rs=db.execute("SELECT * FROM withdrawals WHERE status='pending' ORDER BY id DESC").fetchall(); kb=[]
+                  txt="💸 <b>Pending</b>\n\n"
+                  for r in rs:
+                      txt+=f"#{r['id']} User {r['uid']} | {r['method']} | ৳{r['amount']}\n{r['name']} | {r['number']}\n\n"; kb.append([B(f"✅ #{r['id']}",f"ap:{r['id']}"),B(f"❌ #{r['id']}",f"rj:{r['id']}")])
+                  kb.append([B("⬅️ Admin","ah")]); await q.edit_message_text(txt+("None." if not rs else ""),parse_mode="HTML",reply_markup=M(kb))
+              elif q.data=="au":
+                  rs=db.execute("SELECT id,name,balance FROM users ORDER BY id DESC LIMIT 30").fetchall()
+                  await q.edit_message_text("👥 <b>Users</b>\n\n"+"\n".join(f"{r['id']} {r['name']} ৳{r['balance']:.2f}" for r in rs),parse_mode="HTML",reply_markup=M([[B("⬅️ Admin","ah")]]))
+              elif q.data=="bc": c.user_data["astate"]="bc"; await q.edit_message_text("Send broadcast text:")
+              elif q.data=="ah": await q.message.reply_text("🛠 Admin",reply_markup=M([[B("📊 Stats","as"),B("📋 Tasks","at")],[B("➕ Add Task","add"),B("💸 Withdrawals","aw")],[B("👥 Users","au"),B("📢 Broadcast","bc")]]))
+          async def text(up,c):
+              uid=up.effective_user.id; ensure(up.effective_user); s=c.user_data.get("state")
+              if s=="aname": c.user_data["aname"]=up.message.text.strip(); c.user_data["state"]="anum"; await up.message.reply_text("Enter account number:")
+              elif s=="anum":
+                  n=up.message.text.replace(" ",""); m=c.user_data["method"]
+                  try: db.execute("INSERT INTO accounts(uid,method,name,number) VALUES(?,?,?,?)",(uid,m,c.user_data["aname"],n)); db.commit()
+                  except: pass
+                  c.user_data["state"]="amount"; await up.message.reply_text("Enter withdrawal amount:")
+              elif s=="amount":
+                  try: amt=float(up.message.text)
+                  except: await up.message.reply_text("Enter a number."); return
+                  if amt<5: await up.message.reply_text("Minimum withdrawal is ৳5."); return
+                  r=u(uid)
+                  if amt>r["balance"]: await up.message.reply_text("Insufficient balance."); return
+                  a=db.execute("SELECT * FROM accounts WHERE id=? AND uid=?",(c.user_data["aid"],uid)).fetchone()
+                  db.execute("UPDATE users SET balance=balance-? WHERE id=?",(amt,uid)); db.execute("INSERT INTO withdrawals(uid,method,name,number,amount,created) VALUES(?,?,?,?,?,?)",(uid,a["method"],a["name"],a["number"],amt,now())); db.commit()
+                  c.user_data.pop("state",None); await up.message.reply_text("✅ Withdrawal request submitted. Admin will review it.")
+                  await c.bot.send_message(ADMIN,f"💸 New withdrawal\nUser: {uid}\nMethod: {a['method']}\nAccount: {a['name']} / {a['number']}\nAmount: ৳{amt:.2f}",reply_markup=M([[B("Approve",f"ap:{db.execute('SELECT last_insert_rowid()').fetchone()[0]}"),B("Reject",f"rj:{db.execute('SELECT last_insert_rowid()').fetchone()[0]}")]]))
+              elif uid==ADMIN and c.user_data.get("astate")=="task":
+                  try:
+                      title,kind,reward,url,channel=[x.strip() for x in up.message.text.split("|",4)]
+                      db.execute("INSERT INTO tasks(title,kind,reward,url,channel) VALUES(?,?,?,?,?)",(title,kind,float(reward),url,"" if channel=="-" else channel)); db.commit(); await up.message.reply_text("✅ Task added.")
+                  except: await up.message.reply_text("Format error.")
+                  c.user_data.pop("astate",None)
+              elif uid==ADMIN and c.user_data.get("astate")=="bc":
+                  rs=db.execute("SELECT id FROM users WHERE banned=0").fetchall()
+                  for r in rs:
+                      try: await c.bot.send_message(r["id"],up.message.text)
+                      except: pass
+                  c.user_data.pop("astate",None); await up.message.reply_text("✅ Broadcast sent.")
+          app=Application.builder().token(TOKEN).build()
+          app.add_handler(CommandHandler("start",start)); app.add_handler(CommandHandler("admin",admin))
+          app.add_handler(CommandHandler("id",lambda u,c:u.message.reply_text(f"Your ID: {u.effective_user.id}")))
+          app.add_handler(CallbackQueryHandler(cb)); app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,text))
+          app.run_polling(drop_pending_updates=True)
+          PY
+          python bot.py
